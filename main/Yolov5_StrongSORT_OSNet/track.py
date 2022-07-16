@@ -1,5 +1,6 @@
 import argparse
-
+import cv2
+from collections import deque     
 import os
 # limit the number of cpus used by high performance libraries
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -82,12 +83,12 @@ def run(
 
     # Directories
     if not isinstance(yolo_weights, list):  # single yolo model
-        exp_name = yolo_weights.stem
+        exp_name = str(yolo_weights).rsplit('/', 1)[-1].split('.')[0]
     elif type(yolo_weights) is list and len(yolo_weights) == 1:  # single models after --yolo_weights
-        exp_name = Path(yolo_weights[0]).stem
+        exp_name = yolo_weights[0].split(".")[0]
     else:  # multiple models after --yolo_weights
         exp_name = 'ensemble'
-    exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
+    exp_name = name if name is not None else exp_name + "_" + str(strong_sort_weights).split('/')[-1].split('.')[0]
     save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
     (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
@@ -114,6 +115,8 @@ def run(
 
     # Create as many strong sort instances as there are video sources
     strongsort_list = []
+    # Initialize list to store vehicles counted, that cross the couting line
+    vehiclePass = [] 
     for i in range(nr_sources):
         strongsort_list.append(
             StrongSORT(
@@ -146,13 +149,14 @@ def run(
         dt[0] += t2 - t1
 
         # Inference
-        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if visualize else False
-        pred = model(im, augment=augment, visualize=visualize)
+        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if opt.visualize else False
+        pred = model(im, augment=opt.augment, visualize=visualize)
         t3 = time_sync()
         dt[1] += t3 - t2
 
         # Apply NMS
-        pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det)
+        fps = time_sync() - t3
         dt[2] += time_sync() - t3
 
         # Process detections
@@ -177,6 +181,12 @@ def run(
                     save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
             curr_frames[i] = im0
 
+            # Customize your own crossing line 
+            # Here I set crossing-line height position at 75% of the frame
+            # I set line length equals to the frame width
+            crossLineHeight = int(0.75 * im0.shape[0])
+            crossLineWidth = im0.shape[1]
+	          
             txt_path = str(save_dir / 'tracks' / txt_file_name)  # im.txt
             s += '%gx%g ' % im.shape[2:]  # print string
             imc = im0.copy() if save_crop else im0  # for save_crop
@@ -208,30 +218,38 @@ def run(
                 if len(outputs[i]) > 0:
                     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
     
-                        bboxes = output[0:4]
-                        id = output[4]
-                        cls = output[5]
+                      bboxes = output[0:4]
+                      id = int(output[4])
+                      cls = int(output[5])
+                      x1, y1, x2, y2 = int(bboxes[0]), int(bboxes[1]), int(bboxes[2]), int(bboxes[3])
+                      # calculate the centroid of bounding box
+                      centerpointX = (x1+x2)/2
+                      centerpointY = (y1+y2)/2
+                      centerpoint = (int(centerpointX), int(centerpointY))
+                      # check if object pass the counting line
+                      if crossLineHeight > y1 and crossLineHeight < y2:
+                        vehiclePass.append(id)
 
-                        if save_txt:
-                            # to MOT format
-                            bbox_left = output[0]
-                            bbox_top = output[1]
-                            bbox_w = output[2] - output[0]
-                            bbox_h = output[3] - output[1]
-                            # Write MOT compliant results to file
-                            with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
-                                                               bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
+                      if save_txt:
+                          # to MOT format
+                          bbox_left = output[0]
+                          bbox_top = output[1]
+                          bbox_w = output[2] - output[0]
+                          bbox_h = output[3] - output[1]
+                          # Write MOT compliant results to file
+                          with open(txt_path + '.txt', 'a') as f:
+                              f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
+                                                              bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
 
-                        if save_vid or save_crop or show_vid:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            id = int(id)  # integer id
-                            label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
-                                (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
-                            annotator.box_label(bboxes, label, color=colors(c, True))
-                            if save_crop:
-                                txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
-                                save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+                      if save_vid or save_crop or show_vid:  # Add bbox to image
+                          c = int(cls)  # integer class
+                          id = int(id)  # integer id
+                          label = None if hide_labels else (f'{names[c]} - id: {id}' if hide_conf else \
+                              (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
+                          annotator.box_label(bboxes, label, color=colors(c, True))
+                          if save_crop:
+                              txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
+                              save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
 
                 LOGGER.info(f'{s}Done. YOLO:({t3 - t2:.3f}s), StrongSORT:({t5 - t4:.3f}s)')
 
@@ -239,6 +257,12 @@ def run(
                 strongsort_list[i].increment_ages()
                 LOGGER.info('No detections')
 
+            # Display crossing-line to visualize counting
+            cv2.line(im0, (0, crossLineHeight), (crossLineWidth, crossLineHeight), (0, 255, 0), 4)  
+            # Display count results
+            vehiclePass = list(dict.fromkeys(vehiclePass)) # Remove duplicated id 
+            cv2.putText(im0, f"VEHICLE COUNTED: {len(vehiclePass)}", (30, 60), 1, cv2.FONT_HERSHEY_TRIPLEX, (0, 255, 0), 2, cv2.LINE_AA)
+ 
             # Stream results
             im0 = annotator.result()
             if show_vid:
